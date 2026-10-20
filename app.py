@@ -2,6 +2,7 @@ from __future__ import annotations
 import io
 import streamlit as st
 import pandas as pd
+from storage import has_data, get_data, save_data, get_model, save_model
 from engine import (OPERATORS, BASE_URL, PRIZES, load_draws, digit_matrix,
                     frequency_probs, markov_probs, make_xy, fit_models,
                     combined_probs, rank_numbers, backtest, occurrence_chart)
@@ -26,26 +27,39 @@ def download_operator(name):
     return load_draws(io.BytesIO(response.content))
 
 with st.sidebar:
-    st.header('Data source')
+    st.header('Historical data (saved locally)')
     operator=st.selectbox('Operator',list(OPERATORS))
-    source=st.radio('Load data', ['Download public historical CSV','Upload CSV file'])
-    uploaded=st.file_uploader('CSV file',type=['csv']) if source=='Upload CSV file' else None
-    prize_label=st.selectbox('Target',list(PRIZES),help='First version trains a separate forecast for one prize position, not all 23 winners.')
-    use_ml=st.checkbox('Use XGBoost model',value=True)
-    st.caption('Source: github.com/deadboy18/malaysia-4d. This is a third-party repository, not an official data feed.')
+    prize_label=st.selectbox('Target',list(PRIZES),help='V1 predicts one prize position at a time.')
+    st.caption('Data is saved under local_data/ and reused at every startup.')
+    if st.button('Refresh data from public source'):
+        try:
+            with st.spinner('Downloading and saving latest available public CSV…'):
+                save_data(operator,download_operator(operator))
+            st.success('Local history updated. Existing model remains usable; retrain when appropriate.')
+        except Exception as exc:
+            st.error(f'Refresh failed: {exc}')
+    uploaded=st.file_uploader('Optional: import/update from CSV',type=['csv'])
+    if uploaded is not None and st.button('Save uploaded CSV locally'):
+        try:
+            save_data(operator,load_draws(uploaded))
+            st.success('CSV saved to local_data/ and can be reused.')
+        except Exception as exc:
+            st.error(f'Import failed: {exc}')
+    st.caption('Source: github.com/deadboy18/malaysia-4d; third-party results, not an official feed.')
 
+if not has_data(operator):
+    try:
+        with st.spinner('First run: downloading public history to local_data/…'):
+            save_data(operator,download_operator(operator))
+        st.success('Historical CSV downloaded and permanently saved. No repeat upload required.')
+    except Exception as exc:
+        st.error(f'No local history yet. Initial download failed: {exc}')
+        st.info('Use the file uploader in the sidebar to import a CSV once; it will be saved locally.')
+        st.stop()
 try:
-    if source=='Download public historical CSV':
-        with st.spinner('Downloading dataset…'):
-            df=download_operator(operator)
-    else:
-        if uploaded is None:
-            st.info('Upload a CSV to begin. Required columns: date, prize_1, prize_2, prize_3.')
-            st.stop()
-        df=load_draws(uploaded)
+    df=get_data(operator)
 except Exception as exc:
-    st.error(f'Cannot load the dataset: {exc}')
-    st.info('If GitHub is blocked, open the source repository in your browser, download the CSV, and choose Upload CSV file.')
+    st.error(f'Failed to read saved historical data: {exc}')
     st.stop()
 
 if len(df)<300:
@@ -66,23 +80,49 @@ tab1,tab2,tab3,tab4=st.tabs(['🎯 Forecast','📉 Backtesting','📊 Patterns',
 
 with tab1:
     st.subheader(f'{operator} · Next {prize_label}')
-    st.write('Generate a complete ranking of 0000–9999 using four digit-position models. The model only learns this selected prize column.')
+    st.write('Train once, then use the saved model whenever you generate another forecast. A retrain is optional when new draws arrive.')
     top_n=st.slider('Display top N',5,100,10,5)
-    if st.button('Train and generate forecast',type='primary'):
-        with st.spinner('Training models / computing number ranks…'):
-            try:
-                models=fit_models(*make_xy(digits)) if use_ml else []
-                probs=combined_probs(digits,models,use_ml=use_ml)
-                result=rank_numbers(probs,top_n)
-                st.session_state['forecast']=(operator,prize_label,use_ml,len(df),result,probs)
-            except Exception as exc:
-                st.error(f'Model training failed: {exc}')
+    prize_col=PRIZES[prize_label]
+    try:
+        models,metadata=get_model(operator, prize_col)
+    except Exception as exc:
+        models,metadata=None,None
+        st.error(f'Saved model could not be loaded: {exc}')
+    if models is not None:
+        st.success(f"Saved trained model available · Trained through {metadata.get('latest_draw', 'unknown')} · {metadata.get('training_draws', '?')} historical draws")
+    else:
+        st.info('No saved XGBoost model for this operator and prize. Train it once below.')
+    left,right=st.columns(2)
+    train_now=left.button('Train / Retrain and Save Model',type='secondary')
+    predict_now=right.button('Generate Forecast',type='primary')
+    if train_now:
+        try:
+            with st.spinner('Training and saving four XGBoost models…'):
+                trained=fit_models(*make_xy(digits))
+                save_model(operator,prize_col,trained,{
+                    'training_draws':len(df),
+                    'latest_draw':df['date'].max().strftime('%Y-%m-%d'),
+                    'algorithm':'XGBoost 4 positional classifiers',
+                })
+            st.success('Model trained and saved on disk. The next startup will reuse it.')
+            st.rerun()
+        except Exception as exc:
+            st.error(f'Model training failed: {exc}')
+    if predict_now:
+        try:
+            with st.spinner('Loading saved model and ranking 10,000 numbers…'):
+                probs=combined_probs(digits,models,use_ml=models is not None)
+                result=rank_numbers(probs,100)
+                st.session_state['forecast']=(operator,prize_label,len(df),result,probs,models is not None)
+        except Exception as exc:
+            st.error(f'Forecast failed: {exc}')
     saved=st.session_state.get('forecast')
-    if saved and saved[:4]==(operator,prize_label,use_ml,len(df)):
-        _,_,_,_,result,probs=saved
+    if saved and saved[:3]==(operator,prize_label,len(df)):
+        _,_,_,result,probs,was_ml=saved
+        st.caption('Prediction method: ' + ('saved XGBoost + statistical ensemble' if was_ml else 'statistical baseline only (train XGBoost to enable ML)'))
         st.dataframe(result.head(top_n),hide_index=True,use_container_width=True)
-        st.download_button('Download ranked forecast CSV', result.head(top_n).to_csv(index=False).encode(),file_name='4d_forecast.csv',mime='text/csv')
-        st.caption('Score is a factorized-position model estimate and may be uncalibrated. A truly uniform, independent 4-digit first-prize draw has 0.01% probability per number.')
+        st.download_button('Download ranked forecast CSV',result.head(top_n).to_csv(index=False).encode(),file_name='4d_forecast.csv',mime='text/csv')
+        st.caption('These are model scores, not verified probabilities of winning.')
         per_pos=pd.DataFrame(probs.T,columns=['Position 1','Position 2','Position 3','Position 4'],index=list(range(10)))
         st.write('Per-digit model estimates')
         st.bar_chart(per_pos)
@@ -95,14 +135,14 @@ with tab2:
         with st.spinner('Backtesting…'):
             try:
                 bar=st.progress(0)
-                stats,models,test_start=backtest(digits,use_ml=use_ml,max_test=n_test,progress=bar.progress)
+                stats,models,test_start=backtest(digits,use_ml=True,max_test=n_test,progress=bar.progress)
                 bar.progress(1.0)
-                st.session_state['backtest']=(operator,prize_label,use_ml,len(df),n_test,stats,test_start)
+                st.session_state['backtest']=(operator,prize_label,len(df),n_test,stats,test_start)
             except Exception as exc:
                 st.error(f'Backtest failed: {exc}')
     saved=st.session_state.get('backtest')
-    if saved and saved[:5]==(operator,prize_label,use_ml,len(df),n_test):
-        stats=saved[5]
+    if saved and saved[:4]==(operator,prize_label,len(df),n_test):
+        stats=saved[4]
         st.dataframe(stats,hide_index=True,use_container_width=True)
         st.download_button('Download backtest results',stats.to_csv(index=False),file_name='backtest.csv')
         st.caption('Uniform baseline Top-K values are theoretical expectations, not observed random picks. Finite samples fluctuate. Lower negative log likelihood is better. Model weights are experimental, not optimized or calibrated.')
