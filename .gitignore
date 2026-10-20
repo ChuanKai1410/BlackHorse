@@ -218,3 +218,9 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# BlackHorse local data
+local_data/
+
+# Saved trained models
+saved_models/
